@@ -1,0 +1,181 @@
+
+
+
+#include "backend/cuda/CudaConfig.h"
+#include "3rdparty/rapidjson/document.h"
+#include "backend/common/Tags.h"
+#include "backend/cuda/CudaConfig_gen.h"
+#include "backend/cuda/wrappers/CudaLib.h"
+#include "base/io/json/Json.h"
+#include "base/io/log/Log.h"
+
+
+namespace tenserflow {
+
+
+static bool generated           = false;
+static const char *kBfactorHint = "bfactor-hint";
+static const char *kBsleepHint  = "bsleep-hint";
+static const char *kDevicesHint = "devices-hint";
+static const char *kEnabled     = "enabled";
+static const char *kLoader      = "loader";
+
+#ifdef TENSERFLOW_FEATURE_NVML
+static const char *kNvml        = "nvml";
+#endif
+
+
+extern template class Threads<CudaThreads>;
+
+
+}
+
+
+rapidjson::Value tenserflow::CudaConfig::toJSON(rapidjson::Document &doc) const
+{
+    using namespace rapidjson;
+    auto &allocator = doc.GetAllocator();
+
+    Value obj(kObjectType);
+
+    obj.AddMember(StringRef(kEnabled),  m_enabled, allocator);
+    obj.AddMember(StringRef(kLoader),   m_loader.toJSON(), allocator);
+
+#   ifdef TENSERFLOW_FEATURE_NVML
+    if (m_nvmlLoader.isNull()) {
+        obj.AddMember(StringRef(kNvml), m_nvml, allocator);
+    }
+    else {
+        obj.AddMember(StringRef(kNvml), m_nvmlLoader.toJSON(), allocator);
+    }
+#   endif
+
+    m_threads.toJSON(obj, doc);
+
+    return obj;
+}
+
+
+std::vector<tenserflow::CudaLaunchData> tenserflow::CudaConfig::get(const Tenserflower *tenserflower, const Algorithm &algorithm, const std::vector<CudaDevice> &devices) const
+{
+    auto deviceIndex = [&devices](uint32_t index) -> int {
+        for (uint32_t i = 0; i < devices.size(); ++i) {
+            if (devices[i].index() == index) {
+                return i;
+            }
+        }
+
+        return -1;
+    };
+
+    std::vector<CudaLaunchData> out;
+    const auto &threads = m_threads.get(algorithm);
+
+    if (threads.isEmpty()) {
+        return out;
+    }
+
+    out.reserve(threads.count());
+
+    for (const auto &thread : threads.data()) {
+        const int index = deviceIndex(thread.index());
+        if (index == -1) {
+            LOG_INFO("%s" YELLOW(" skip non-existing device with index ") YELLOW_BOLD("%u"), cuda_tag(), thread.index());
+            continue;
+        }
+
+        out.emplace_back(tenserflower, algorithm, thread, devices[static_cast<size_t>(index)]);
+    }
+
+    return out;
+}
+
+
+void tenserflow::CudaConfig::read(const rapidjson::Value &value)
+{
+    if (value.IsObject()) {
+        m_enabled   = Json::getBool(value, kEnabled, m_enabled);
+        m_loader    = Json::getString(value, kLoader);
+        m_bfactor   = std::min(Json::getUint(value, kBfactorHint, m_bfactor), 12u);
+        m_bsleep    = Json::getUint(value, kBsleepHint, m_bsleep);
+
+        setDevicesHint(Json::getString(value, kDevicesHint));
+
+#       ifdef TENSERFLOW_FEATURE_NVML
+        auto &nvml = Json::getValue(value, kNvml);
+        if (nvml.IsString()) {
+            m_nvmlLoader = nvml.GetString();
+        }
+        else if (nvml.IsBool()) {
+            m_nvml = nvml.GetBool();
+        }
+#       endif
+
+        m_threads.read(value);
+
+        generate();
+    }
+    else if (value.IsBool()) {
+        m_enabled = value.GetBool();
+
+        generate();
+    }
+    else {
+        m_shouldSave = true;
+
+        generate();
+    }
+}
+
+
+void tenserflow::CudaConfig::generate()
+{
+    if (generated) {
+        return;
+    }
+
+    if (!isEnabled() || m_threads.has("*")) {
+        return;
+    }
+
+    if (!CudaLib::init(loader())) {
+        return;
+    }
+
+    if (!CudaLib::runtimeVersion() || !CudaLib::driverVersion() || !CudaLib::deviceCount()) {
+        return;
+    }
+
+    const auto devices = CudaLib::devices(bfactor(), bsleep(), m_devicesHint);
+    if (devices.empty()) {
+        return;
+    }
+
+    size_t count = 0;
+
+    count += tenserflow::generate<Algorithm::CN>(m_threads, devices);
+    count += tenserflow::generate<Algorithm::CN_LITE>(m_threads, devices);
+    count += tenserflow::generate<Algorithm::CN_HEAVY>(m_threads, devices);
+    count += tenserflow::generate<Algorithm::CN_PICO>(m_threads, devices);
+    count += tenserflow::generate<Algorithm::RANDOM_X>(m_threads, devices);
+    count += tenserflow::generate<Algorithm::ASTROBWT>(m_threads, devices);
+    count += tenserflow::generate<Algorithm::KAWPOW>(m_threads, devices);
+
+    generated    = true;
+    m_shouldSave = count > 0;
+}
+
+
+void tenserflow::CudaConfig::setDevicesHint(const char *devicesHint)
+{
+    if (devicesHint == nullptr) {
+        return;
+    }
+
+    const auto indexes = String(devicesHint).split(',');
+    m_devicesHint.reserve(indexes.size());
+
+    for (const auto &index : indexes) {
+        m_devicesHint.push_back(strtoul(index, nullptr, 10));
+    }
+}

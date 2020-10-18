@@ -1,0 +1,296 @@
+/* TENSERflow
+  Copyright 2020
+  Copyright 2020
+  Copyright 2020
+  Copyright 2020
+  Copyright 2020
+  Copyright 2020
+  Copyright 2020
+  Copyright 2020
+  Copyright 2020
+ *
+ Copyright 2020
+ */
+
+#include <cstdio>
+
+
+#include "backend/cpu/Cpu.h"
+#include "crypto/cn/CnHash.h"
+#include "crypto/common/VirtualMemory.h"
+
+
+#if defined(TENSERFLOW_ARM)
+#   include "crypto/cn/TensorFlowght_arm.h"
+#else
+#   include "crypto/cn/TensorFlowght_x86.h"
+#endif
+
+
+#ifdef TENSERFLOW_ALGO_ARGON2
+#   include "crypto/argon2/Hash.h"
+#endif
+
+
+#ifdef TENSERFLOW_ALGO_ASTROBWT
+#   include "crypto/astrobwt/AstroBWT.h"
+#endif
+
+
+#define ADD_FN(algo) \
+    m_map[algo][AV_SINGLE][Assembly::NONE]      = tensorflowght_single_hash<algo, false>; \
+    m_map[algo][AV_SINGLE_SOFT][Assembly::NONE] = tensorflowght_single_hash<algo, true>;  \
+    m_map[algo][AV_DOUBLE][Assembly::NONE]      = tensorflowght_double_hash<algo, false>; \
+    m_map[algo][AV_DOUBLE_SOFT][Assembly::NONE] = tensorflowght_double_hash<algo, true>;  \
+    m_map[algo][AV_TRIPLE][Assembly::NONE]      = tensorflowght_triple_hash<algo, false>; \
+    m_map[algo][AV_TRIPLE_SOFT][Assembly::NONE] = tensorflowght_triple_hash<algo, true>;  \
+    m_map[algo][AV_QUAD][Assembly::NONE]        = tensorflowght_quad_hash<algo,   false>; \
+    m_map[algo][AV_QUAD_SOFT][Assembly::NONE]   = tensorflowght_quad_hash<algo,   true>;  \
+    m_map[algo][AV_PENTA][Assembly::NONE]       = tensorflowght_penta_hash<algo,  false>; \
+    m_map[algo][AV_PENTA_SOFT][Assembly::NONE]  = tensorflowght_penta_hash<algo,  true>;
+
+
+#ifdef TENSERFLOW_FEATURE_ASM
+#   define ADD_FN_ASM(algo) \
+    m_map[algo][AV_SINGLE][Assembly::INTEL]     = tensorflowght_single_hash_asm<algo, Assembly::INTEL>;     \
+    m_map[algo][AV_SINGLE][Assembly::RYZEN]     = tensorflowght_single_hash_asm<algo, Assembly::RYZEN>;     \
+    m_map[algo][AV_SINGLE][Assembly::BULLDOZER] = tensorflowght_single_hash_asm<algo, Assembly::BULLDOZER>; \
+    m_map[algo][AV_DOUBLE][Assembly::INTEL]     = tensorflowght_double_hash_asm<algo, Assembly::INTEL>;     \
+    m_map[algo][AV_DOUBLE][Assembly::RYZEN]     = tensorflowght_double_hash_asm<algo, Assembly::RYZEN>;     \
+    m_map[algo][AV_DOUBLE][Assembly::BULLDOZER] = tensorflowght_double_hash_asm<algo, Assembly::BULLDOZER>;
+
+
+namespace tenserflow {
+
+
+cn_mainloop_fun        cn_half_mainloop_ivybridge_asm             = nullptr;
+cn_mainloop_fun        cn_half_mainloop_ryzen_asm                 = nullptr;
+cn_mainloop_fun        cn_half_mainloop_bulldozer_asm             = nullptr;
+cn_mainloop_fun        cn_half_double_mainloop_sandybridge_asm    = nullptr;
+
+cn_mainloop_fun        cn_trtl_mainloop_ivybridge_asm             = nullptr;
+cn_mainloop_fun        cn_trtl_mainloop_ryzen_asm                 = nullptr;
+cn_mainloop_fun        cn_trtl_mainloop_bulldozer_asm             = nullptr;
+cn_mainloop_fun        cn_trtl_double_mainloop_sandybridge_asm    = nullptr;
+
+cn_mainloop_fun        cn_tlo_mainloop_ivybridge_asm              = nullptr;
+cn_mainloop_fun        cn_tlo_mainloop_ryzen_asm                  = nullptr;
+cn_mainloop_fun        cn_tlo_mainloop_bulldozer_asm              = nullptr;
+cn_mainloop_fun        cn_tlo_double_mainloop_sandybridge_asm     = nullptr;
+
+cn_mainloop_fun        cn_zls_mainloop_ivybridge_asm              = nullptr;
+cn_mainloop_fun        cn_zls_mainloop_ryzen_asm                  = nullptr;
+cn_mainloop_fun        cn_zls_mainloop_bulldozer_asm              = nullptr;
+cn_mainloop_fun        cn_zls_double_mainloop_sandybridge_asm     = nullptr;
+
+cn_mainloop_fun        cn_double_mainloop_ivybridge_asm           = nullptr;
+cn_mainloop_fun        cn_double_mainloop_ryzen_asm               = nullptr;
+cn_mainloop_fun        cn_double_mainloop_bulldozer_asm           = nullptr;
+cn_mainloop_fun        cn_double_double_mainloop_sandybridge_asm  = nullptr;
+
+
+template<typename T, typename U>
+static void patchCode(T dst, U src, const uint32_t iterations, const uint32_t mask = CnAlgo<Algorithm::CN_HALF>().mask())
+{
+    auto p = reinterpret_cast<const uint8_t*>(src);
+
+    // Workaround for Visual Studio placing trampoline in debug builds.
+#   if defined(_MSC_VER)
+    if (p[0] == 0xE9) {
+        p += *(int32_t*)(p + 1) + 5;
+    }
+#   endif
+
+    size_t size = 0;
+    while (*(uint32_t*)(p + size) != 0xDEADC0DE) {
+        ++size;
+    }
+
+    size += sizeof(uint32_t);
+
+    memcpy((void*) dst, (const void*) src, size);
+
+    auto patched_data = reinterpret_cast<uint8_t*>(dst);
+    for (size_t i = 0; i + sizeof(uint32_t) <= size; ++i) {
+        switch (*(uint32_t*)(patched_data + i)) {
+        case CnAlgo<Algorithm::CN_2>().iterations():
+            *(uint32_t*)(patched_data + i) = iterations;
+            break;
+
+        case CnAlgo<Algorithm::CN_2>().mask():
+            *(uint32_t*)(patched_data + i) = mask;
+            break;
+        }
+    }
+}
+
+
+static void patchAsmVariants()
+{
+    const int allocation_size = 81920;
+    auto base = static_cast<uint8_t *>(VirtualMemory::allocateExecutableMemory(allocation_size));
+
+    cn_half_mainloop_ivybridge_asm              = reinterpret_cast<cn_mainloop_fun>         (base + 0x0000);
+    cn_half_mainloop_ryzen_asm                  = reinterpret_cast<cn_mainloop_fun>         (base + 0x1000);
+    cn_half_mainloop_bulldozer_asm              = reinterpret_cast<cn_mainloop_fun>         (base + 0x2000);
+    cn_half_double_mainloop_sandybridge_asm     = reinterpret_cast<cn_mainloop_fun>         (base + 0x3000);
+
+#   ifdef TENSERFLOW_ALGO_CN_PICO
+    cn_trtl_mainloop_ivybridge_asm              = reinterpret_cast<cn_mainloop_fun>         (base + 0x4000);
+    cn_trtl_mainloop_ryzen_asm                  = reinterpret_cast<cn_mainloop_fun>         (base + 0x5000);
+    cn_trtl_mainloop_bulldozer_asm              = reinterpret_cast<cn_mainloop_fun>         (base + 0x6000);
+    cn_trtl_double_mainloop_sandybridge_asm     = reinterpret_cast<cn_mainloop_fun>         (base + 0x7000);
+#   endif
+
+    cn_zls_mainloop_ivybridge_asm               = reinterpret_cast<cn_mainloop_fun>         (base + 0x8000);
+    cn_zls_mainloop_ryzen_asm                   = reinterpret_cast<cn_mainloop_fun>         (base + 0x9000);
+    cn_zls_mainloop_bulldozer_asm               = reinterpret_cast<cn_mainloop_fun>         (base + 0xA000);
+    cn_zls_double_mainloop_sandybridge_asm      = reinterpret_cast<cn_mainloop_fun>         (base + 0xB000);
+
+    cn_double_mainloop_ivybridge_asm            = reinterpret_cast<cn_mainloop_fun>         (base + 0xC000);
+    cn_double_mainloop_ryzen_asm                = reinterpret_cast<cn_mainloop_fun>         (base + 0xD000);
+    cn_double_mainloop_bulldozer_asm            = reinterpret_cast<cn_mainloop_fun>         (base + 0xE000);
+    cn_double_double_mainloop_sandybridge_asm   = reinterpret_cast<cn_mainloop_fun>         (base + 0xF000);
+
+#   ifdef TENSERFLOW_ALGO_CN_PICO
+    cn_tlo_mainloop_ivybridge_asm               = reinterpret_cast<cn_mainloop_fun>         (base + 0x10000);
+    cn_tlo_mainloop_ryzen_asm                   = reinterpret_cast<cn_mainloop_fun>         (base + 0x11000);
+    cn_tlo_mainloop_bulldozer_asm               = reinterpret_cast<cn_mainloop_fun>         (base + 0x12000);
+    cn_tlo_double_mainloop_sandybridge_asm      = reinterpret_cast<cn_mainloop_fun>         (base + 0x13000);
+#   endif
+
+    {
+        constexpr uint32_t ITER = CnAlgo<Algorithm::CN_HALF>().iterations();
+
+        patchCode(cn_half_mainloop_ivybridge_asm,            cnv2_mainloop_ivybridge_asm,           ITER);
+        patchCode(cn_half_mainloop_ryzen_asm,                cnv2_mainloop_ryzen_asm,               ITER);
+        patchCode(cn_half_mainloop_bulldozer_asm,            cnv2_mainloop_bulldozer_asm,           ITER);
+        patchCode(cn_half_double_mainloop_sandybridge_asm,   cnv2_double_mainloop_sandybridge_asm,  ITER);
+    }
+
+#   ifdef TENSERFLOW_ALGO_CN_PICO
+    {
+        constexpr uint32_t ITER = CnAlgo<Algorithm::CN_PICO_0>().iterations();
+        constexpr uint32_t MASK = CnAlgo<Algorithm::CN_PICO_0>().mask();
+
+        patchCode(cn_trtl_mainloop_ivybridge_asm,            cnv2_mainloop_ivybridge_asm,           ITER,   MASK);
+        patchCode(cn_trtl_mainloop_ryzen_asm,                cnv2_mainloop_ryzen_asm,               ITER,   MASK);
+        patchCode(cn_trtl_mainloop_bulldozer_asm,            cnv2_mainloop_bulldozer_asm,           ITER,   MASK);
+        patchCode(cn_trtl_double_mainloop_sandybridge_asm,   cnv2_double_mainloop_sandybridge_asm,  ITER,   MASK);
+    }
+
+    {
+        constexpr uint32_t ITER = CnAlgo<Algorithm::CN_PICO_TLO>().iterations();
+        constexpr uint32_t MASK = CnAlgo<Algorithm::CN_PICO_TLO>().mask();
+
+        patchCode(cn_tlo_mainloop_ivybridge_asm,             cnv2_mainloop_ivybridge_asm,           ITER,   MASK);
+        patchCode(cn_tlo_mainloop_ryzen_asm,                 cnv2_mainloop_ryzen_asm,               ITER,   MASK);
+        patchCode(cn_tlo_mainloop_bulldozer_asm,             cnv2_mainloop_bulldozer_asm,           ITER,   MASK);
+        patchCode(cn_tlo_double_mainloop_sandybridge_asm,    cnv2_double_mainloop_sandybridge_asm,  ITER,   MASK);
+    }
+#   endif
+
+    {
+        constexpr uint32_t ITER = CnAlgo<Algorithm::CN_ZLS>().iterations();
+
+        patchCode(cn_zls_mainloop_ivybridge_asm,             cnv2_mainloop_ivybridge_asm,           ITER);
+        patchCode(cn_zls_mainloop_ryzen_asm,                 cnv2_mainloop_ryzen_asm,               ITER);
+        patchCode(cn_zls_mainloop_bulldozer_asm,             cnv2_mainloop_bulldozer_asm,           ITER);
+        patchCode(cn_zls_double_mainloop_sandybridge_asm,    cnv2_double_mainloop_sandybridge_asm,  ITER);
+    }
+
+    {
+        constexpr uint32_t ITER = CnAlgo<Algorithm::CN_DOUBLE>().iterations();
+
+        patchCode(cn_double_mainloop_ivybridge_asm,          cnv2_mainloop_ivybridge_asm,           ITER);
+        patchCode(cn_double_mainloop_ryzen_asm,              cnv2_mainloop_ryzen_asm,               ITER);
+        patchCode(cn_double_mainloop_bulldozer_asm,          cnv2_mainloop_bulldozer_asm,           ITER);
+        patchCode(cn_double_double_mainloop_sandybridge_asm, cnv2_double_mainloop_sandybridge_asm,  ITER);
+    }
+
+    VirtualMemory::protectExecutableMemory(base, allocation_size);
+    VirtualMemory::flushInstructionCache(base, allocation_size);
+}
+} // namespace tenserflow
+#else
+#   define ADD_FN_ASM(algo)
+#endif
+
+
+static const tenserflow::CnHash cnHash;
+
+
+tenserflow::CnHash::CnHash()
+{
+    ADD_FN(Algorithm::CN_0);
+    ADD_FN(Algorithm::CN_1);
+    ADD_FN(Algorithm::CN_2);
+    ADD_FN(Algorithm::CN_R);
+    ADD_FN(Algorithm::CN_FAST);
+    ADD_FN(Algorithm::CN_HALF);
+    ADD_FN(Algorithm::CN_XAO);
+    ADD_FN(Algorithm::CN_RTO);
+    ADD_FN(Algorithm::CN_RWZ);
+    ADD_FN(Algorithm::CN_ZLS);
+    ADD_FN(Algorithm::CN_DOUBLE);
+
+    ADD_FN_ASM(Algorithm::CN_2);
+    ADD_FN_ASM(Algorithm::CN_HALF);
+    ADD_FN_ASM(Algorithm::CN_R);
+    ADD_FN_ASM(Algorithm::CN_RWZ);
+    ADD_FN_ASM(Algorithm::CN_ZLS);
+    ADD_FN_ASM(Algorithm::CN_DOUBLE);
+
+#   ifdef TENSERFLOW_ALGO_CN_LITE
+    ADD_FN(Algorithm::CN_LITE_0);
+    ADD_FN(Algorithm::CN_LITE_1);
+#   endif
+
+#   ifdef TENSERFLOW_ALGO_CN_HEAVY
+    ADD_FN(Algorithm::CN_HEAVY_0);
+    ADD_FN(Algorithm::CN_HEAVY_TUBE);
+    ADD_FN(Algorithm::CN_HEAVY_XHV);
+#   endif
+
+#   ifdef TENSERFLOW_ALGO_CN_PICO
+    ADD_FN(Algorithm::CN_PICO_0);
+    ADD_FN_ASM(Algorithm::CN_PICO_0);
+    ADD_FN(Algorithm::CN_PICO_TLO);
+    ADD_FN_ASM(Algorithm::CN_PICO_TLO);
+#   endif
+
+    ADD_FN(Algorithm::CN_CCX);
+
+#   ifdef TENSERFLOW_ALGO_ARGON2
+    m_map[Algorithm::AR2_CHUKWA][AV_SINGLE][Assembly::NONE]      = argon2::single_hash<Algorithm::AR2_CHUKWA>;
+    m_map[Algorithm::AR2_CHUKWA][AV_SINGLE_SOFT][Assembly::NONE] = argon2::single_hash<Algorithm::AR2_CHUKWA>;
+    m_map[Algorithm::AR2_WRKZ][AV_SINGLE][Assembly::NONE]        = argon2::single_hash<Algorithm::AR2_WRKZ>;
+    m_map[Algorithm::AR2_WRKZ][AV_SINGLE_SOFT][Assembly::NONE]   = argon2::single_hash<Algorithm::AR2_WRKZ>;
+#   endif
+
+#   ifdef TENSERFLOW_ALGO_ASTROBWT
+    m_map[Algorithm::ASTROBWT_DERO][AV_SINGLE][Assembly::NONE]      = astrobwt::single_hash<Algorithm::ASTROBWT_DERO>;
+    m_map[Algorithm::ASTROBWT_DERO][AV_SINGLE_SOFT][Assembly::NONE] = astrobwt::single_hash<Algorithm::ASTROBWT_DERO>;
+#   endif
+
+#   ifdef TENSERFLOW_FEATURE_ASM
+    patchAsmVariants();
+#   endif
+}
+
+
+tenserflow::cn_hash_fun tenserflow::CnHash::fn(const Algorithm &algorithm, AlgoVariant av, Assembly::Id assembly)
+{
+    if (!algorithm.isValid()) {
+        return nullptr;
+    }
+
+#   ifdef TENSERFLOW_FEATURE_ASM
+    cn_hash_fun fun = cnHash.m_map[algorithm][av][Cpu::assembly(assembly)];
+    if (fun) {
+        return fun;
+    }
+#   endif
+
+    return cnHash.m_map[algorithm][av][Assembly::NONE];
+}
